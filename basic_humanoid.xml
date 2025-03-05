@@ -168,10 +168,10 @@
           <geom name="lower_arm_right" fromto=".01 .01 .01 .17 .17 .17" class="arm_lower"/>
           <body name="hand_right" pos=".18 .18 .18">
             <geom name="hand_right" zaxis="1 1 1" class="hand"/>
-            <body name="tray" pos="0 0.15 0">
+            <body name="tray" pos="0 0.17 0">
                 <geom name="tray_geom" type="box" size="0.1 0.25 0.01" rgba="0.6 0.6 0.6 1"
                     contype="1" conaffinity="1"/>
-                <site name="tray_site" pos="0 0.125 0" size="0.005" rgba="0 1 0 1"/>
+                <site name="tray_site" pos="0 0.24 -0.01" size="0.005" rgba="0 1 0 1"/>
             </body>
           </body>
         </body>
@@ -196,15 +196,16 @@
     </body> -->
 
     <!-- New Box: a free body that initially rests on the tray -->
-    <body name="box" pos="0.5 0 1.46">
+    <body name="box" pos="0.36 0 1.402">
       <joint type="free"/>
       <inertial pos="0 0 0" mass="0.2" fullinertia="0.0003333 0.0003333 0.0003333 0 0 0"/>
       <geom name="box_geom" type="box" size="0.05 0.05 0.05" rgba="0.8 0.2 0.2 1" contype="1" conaffinity="1"/>
+      <!--site name="box_site" pos="0 0 0" size="0.005" rgba="0 1 0 1"/> -->
     </body>
   </worldbody>
 
   <tendon>
-    <spatial name="left_hand_to_tray" stiffness="1000" damping="0.5">
+    <spatial name="left_hand_to_tray" stiffness="500" damping="0.5">
       <site site="hand_left_site"/>
       <site site="tray_site"/>
     </spatial>
@@ -213,6 +214,9 @@
   <equality>
     <weld body1="hand_right" body2="tray" anchor="0.5 0 1.4"/>
     <weld body1="hand_left" body2="tray" anchor="0.5 0 1.4"/>
+  </equality> -->
+  <!-- <equality>
+    <weld body1="hand_left" body2="tray" anchor="0.36 0.23 1.342" solref="0.0005 1" solimp="0.0005 0.0005 0.0005"/>
   </equality> -->
 
   <contact>
