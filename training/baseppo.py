@@ -209,7 +209,7 @@ class TrajectoryBuffer():
       """
       The purpose of this function is to do mini-batch stochastic gradient descent (SGD)
       instead of full-batch GD. Dictionary of trajectories is wrapped in custom dataset class.
-      That is then wrapped in torch.utils.data.DataLoader. Allows variable batch sizes and shuffling.
+      That is then wrapped in `torch.utils.data.DataLoader`. Allows variable batch sizes and shuffling.
       
          :param batch_size = mini batch size.
       """
@@ -227,14 +227,16 @@ class ActorCritic():
       self.v = Critic(state_dim)
       # Buffer
       self.buffer = TrajectoryBuffer(state_dim, action_dim, size=buffer_size)
+      self.buffer_size = buffer_size
       self.pi_losses = []
       self.v_losses = []
       # Hyperparameters
       self.ratio_clip = 0.2
       self.pi_optim = optim.Adam(self.pi.parameters(), lr=2e-4)
-      self.critic_opt = optim.Adam(self.v.parameters(), lr=5e-4)
-      self.pi_gradsteps = 10
-      self.v_gradsteps = 10
+      self.critic_opt = optim.Adam(self.v.parameters(), lr=3e-4)
+      self.pi_gradsteps = 7
+      self.v_gradsteps = 7
+      self.minib_size = 64
       #Other
       self.verbose = verbose
 
@@ -300,30 +302,47 @@ class ActorCritic():
 
 
    def gradient_step(self):
-      trajectories = self.buffer.get_trajectories()
-      # For tracking purposes: what was the actor/critic loss to begin with?
-      self.pi_losses.append(self.compute_actor_loss(trajectories))
-      self.v_losses.append(self.compute_critic_loss(trajectories))
+      """
+      After completely filling the buffer, this function does mini-batch SGD over the entire
+      buffer, for both the actor and the critic, `self.pi_gradsteps` and `self.v_gradsteps` times,
+      respectively.
+      """
+      # These trajectories are wrapped by the `torch.utils.data.Dataloader` class
+      trajectories = self.buffer.get_trajectories_as_DataLoader(batch_size=self.minib_size)
 
-      # GRADIENT STEPS ON CRITIC
+      # N full passes of buffer on critic
       for _ in range(self.v_gradsteps):
-         self.critic_opt.zero_grad()
-         critic_loss = self.compute_critic_loss(trajectories)
-         critic_loss.backward()
-         self.critic_opt.step()
+         # Track average loss over buffer and keep for logging purpose
+         loss = []
+         # mini batch SGD over entire buffer
+         for minib_traj in trajectories:
+            self.critic_opt.zero_grad()
+            critic_loss = self.compute_critic_loss(minib_traj)
+            critic_loss.backward()
+            self.critic_opt.step()
+            loss.append(critic_loss.item())
+         
+         self.v_losses.append(np.mean(loss))
 
-      #GRADIENT STEP ON ACTOR
+      #N full passes of buffer on actor
       for _ in range(self.pi_gradsteps):
-         self.pi_optim.zero_grad()
-         actor_loss = self.compute_actor_loss(trajectories)
-         actor_loss.backward()
-         self.pi_optim.step()
+         # Track average loss over buffer and keep for logging purpose
+         loss = []
+         #mini batch SGD over entire buffer
+         for minib_traj in trajectories:
+            self.pi_optim.zero_grad()
+            actor_loss = self.compute_actor_loss(minib_traj)
+            actor_loss.backward()
+            self.pi_optim.step()
+            loss.append(actor_loss.item())
+         
+         self.pi_losses.append(np.mean(loss))
    
-   def train(self, env, epochs, steps_per_epoch):
+   def train(self, env, epochs):
       for i in range(epochs):
          state, _ = env.reset()
          trajectory_rewards = 0
-         for _ in range(steps_per_epoch):
+         for _ in range(self.buffer_size):
             action, log_prob, value = self.step(torch.as_tensor(state, dtype=torch.float32))
             state_p, reward, done, _,  _ = env.step(action)
             self.buffer.add_experience(state, action, log_prob, value, reward)
@@ -341,8 +360,8 @@ class ActorCritic():
             final_state_v = self.v(torch.as_tensor(state_p, dtype=torch.float32)).detach()
             self.buffer.calculate_advantages(final_state_v)
          self.gradient_step()
-         print(f"ACTOR LOSSES FOR EPOCH {i}: {self.pi_losses[-1]}\n")
-         print(f"CRITIC LOSSES FOR EPOCH {i}: {self.v_losses[-1]}\n\n")
+         print(f"ACTOR LOSSES FOR EPOCH {i}. BEFORE: {self.pi_losses[-5]}\tAFTER: {self.pi_losses[-1]}\n")
+         print(f"CRITIC LOSSES FOR EPOCH {i}. BEFORE: {self.v_losses[-5]}\tAFTER: {self.v_losses[-1]}\n\n")
 
 
 
@@ -396,7 +415,6 @@ class ActorCritic():
 # distributions = check._get_distribution(test_data)
 # actions = distributions.sample()
 # print(actions)
-
 
 
 

@@ -5,7 +5,7 @@ import numpy as np
 import time
 
 
-env = gym.make('Ant-v5', terminate_when_unhealthy=True)
+env = gym.make('Humanoid-v5', terminate_when_unhealthy=True)
 # print(env.observation_space.shape[0])
 # state, _ = env.reset()
 # state, reward, = env.step(np.random.rand(env.action_space.shape))
@@ -13,8 +13,8 @@ env = gym.make('Ant-v5', terminate_when_unhealthy=True)
 #print(state)
 # print(reward)
 # print(done)
-ppo = baseppo.ActorCritic(env.observation_space.shape[0], env.action_space.shape[0], buffer_size=4000)
-ppo.train(env=env, epochs=25, steps_per_epoch=4000)
+ppo = baseppo.ActorCritic(env.observation_space.shape[0], env.action_space.shape[0], buffer_size=2048)
+ppo.train(env=env, epochs=30)
 # torch.save(ppo.pi.state_dict(), "rl_models/pi")
 # torch.save(ppo.v.state_dict(), "rl_models/v")
 # ppo.v.load_state_dict(torch.load("rl_models/v"))
@@ -26,7 +26,7 @@ ppo.train(env=env, epochs=25, steps_per_epoch=4000)
 
 
 
-env = gym.make('Ant-v5', render_mode="human", terminate_when_unhealthy=True)
+env = gym.make('Humanoid-v5', render_mode="human", terminate_when_unhealthy=True)
 rewards = []
 with torch.no_grad():
    while True:
