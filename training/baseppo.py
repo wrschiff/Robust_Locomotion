@@ -18,6 +18,23 @@ def discounted_sum(discount_factor, arr):
    """
    return scipy.signal.lfilter([1], [1, float(-discount_factor)], arr[::-1], axis=0)[::-1]
 
+def init_policy_network(mod):
+   """
+   Takes a torch module. Checks if it is a linear layer (we don't initialize activation functions)\n
+   For the last layer, initializes to 100x smaller weights than the other layers.
+   Uses `xavier_uniform_` distribution.
+   """
+   if isinstance(mod, nn.Linear):
+      # We added this attribute for the last layer
+      if hasattr(mod, "is_policy_output"):
+         # 100x smaller than otherewise (1)
+         nn.init.xavier_uniform_(mod.weight, 0.01) 
+      else:
+         nn.init.xavier_uniform_(mod.weight)
+      
+      if mod.bias is not None:
+         nn.init.zeros_(mod.bias)
+
 
 ###################### POLICY CLASS ######################
 
@@ -26,16 +43,26 @@ class Policy(nn.Module):
    A stochastic policy parameterized by a neural network. Outputs the mean of
    a gaussian for each action, with the STD initialized to e^(-0.5)
    """
-   def __init__(self, num_features, num_actions):
+   def __init__(self, num_features: int, num_actions: int, action_range: int):
+      """
+         :param num_features = size of observation space / num input features into network\n
+         :param num_actions = size of actions space / num output features from network\n
+         :param action range = absolute value of continuous action range
+      """
       super().__init__()
+      self.action_range = action_range
       self.log_std = torch.nn.Parameter(-0.5*torch.ones(num_actions))
       self.layers = nn.Sequential(
-         nn.Linear(in_features=num_features, out_features=64),
+         nn.Linear(in_features=num_features, out_features=128),
          nn.Tanh(),
-         nn.Linear(in_features=64, out_features=64),
+         nn.Linear(in_features=128, out_features=128),
          nn.Tanh(),
-         nn.Linear(in_features=64, out_features=num_actions)
+         nn.Linear(in_features=128, out_features=num_actions)
       )
+      # Define an attribute of the last layer that signifies it as policy output
+      # We will initialize this last layer with 100x smaller weights (https://arxiv.org/pdf/2006.05990)
+      self.layers[-1].is_policy_output = True
+      self.apply(init_policy_network)
    
    def _get_distribution(self, x):
       """
@@ -45,14 +72,21 @@ class Policy(nn.Module):
       mus = self.layers(x)
       return Normal(mus, torch.exp(self.log_std))
    
-   def _get_log_probs(self, distr: Normal, actions) -> torch.Tensor:
+   def _get_log_probs(self, distr: Normal,raw_actions) -> torch.Tensor:
       """
       Returns the log probability of some action being chosen.
       Note that exp( log(pi'(a)) - log(pi(a)) ) = pi'(a) / pi(a), but is more numerically stable.
       Also: log( pi(a_1) * pi(a_2) * ... * pi(a_n) ) = log(pi(a_1)) + log(pi(a_2)) + ... for N dimensions
       of action vector.
       """
-      return distr.log_prob(actions).sum(axis=-1)
+      ### NEW: u = tanh(x), where x is the raw action.
+      #logP(u) = logP(x) - logtanh'(x)
+      log_act = distr.log_prob(raw_actions)
+      # Since we want the log prob of the true action, we need to add this correction
+      correction = torch.log(self.action_range * (1 - torch.tanh(raw_actions)**2) + 1e-6) # Small constant for numerical stability
+      #return (log_act - correction).sum(axis=-1)
+      ## OLD VERSION, we know this works:
+      return distr.log_prob(raw_actions).sum(axis=-1)
    
 ###################### VALUE FUNCTION CLASS ######################   
 
@@ -60,11 +94,11 @@ class Critic(nn.Module):
    def __init__(self, num_features):
       super().__init__()
       self.layers = nn.Sequential(
-         nn.Linear(in_features=num_features, out_features=64),
+         nn.Linear(in_features=num_features, out_features=128),
          nn.Tanh(),
-         nn.Linear(in_features=64, out_features=64),
+         nn.Linear(in_features=128, out_features=128),
          nn.Tanh(),
-         nn.Linear(in_features=64, out_features=1)
+         nn.Linear(in_features=128, out_features=1)
       )
    
    def forward(self, batch):
@@ -147,7 +181,7 @@ class TrajectoryBuffer():
       self.rewards          = np.zeros_like(self.rewards)
       self.returns          = np.zeros_like(self.returns)
 
-   def add_experience(self, s, a: torch.Tensor, prev_prob, vals: torch.Tensor, reward):
+   def add_experience(self, s, a, prev_prob, vals, reward):
       """
       At each time step, we add the experience. Value of an action is estimated at this point.
       GAE Advantage will be calculated later using these values, and will scale the gradient.
@@ -165,7 +199,6 @@ class TrajectoryBuffer():
       At the end of a trajectory, go back and compute GAE estimated advantages (for actor loss)
       AND true discounted return (for critic loss)
       """
-      # Note: currently NOT using final_V, as I assume all trajectories end from terminal state
       sliced = slice(self.trajectory_start, self.idx)
       #print(f"TRAJECTORY START: {self.trajectory_start}")
       ##### CALCULATE GAE ######
@@ -173,12 +206,11 @@ class TrajectoryBuffer():
       trajectory_rewards = np.append(self.rewards[sliced], final_V)
       # (V_1, V_2, ... V_h)
       values = np.append(self.vals[sliced], final_V)
-      #print(f"TRAJECTORY REWARDS:\n{trajectory_rewards}\n\nVALUES:\n{values}")
+
       # r_t + gamma * V_{t+1} - V_t
       deltas = trajectory_rewards[:-1] + self.gamma * values[1:] - values[:-1]
-      #print(f"DELTAS:\n{deltas}")
       self.advantage[sliced] = discounted_sum(self.gamma * self.lam, deltas)
-      #print(f"ADVANTAGES: {self.advantage}")
+
 
       ##### CALCULATE DISCOUNTED RETURN AT EACH TIME STEP ########
       trajectory_returns = discounted_sum(self.gamma, trajectory_rewards)[:-1]
@@ -193,11 +225,16 @@ class TrajectoryBuffer():
       Buffer will reset via zeroing indices -- which will overwrite previous values.
       """
       assert self.idx == self.epoch_size
-      self.idx, self.trajectory_start = 0, 0
+      self.idx = 0
+      self.trajectory_start = 0
       # Normalize the advantage values.
       adv_mean = self.advantage.mean()
       adv_std = self.advantage.std()
       self.advantage = (self.advantage - adv_mean) / (adv_std + 1e-8)
+      # Normalize the return values -- DOESNT WORK
+      # ret_mean = self.returns.mean()
+      # ret_std = self.returns.std()
+      # self.returns = (self.returns - ret_mean) / (ret_std + 1e-8)
       return dict(states        = torch.as_tensor(self.states, dtype=torch.float32), 
                   acts          = torch.as_tensor(self.actions, dtype=torch.float32), 
                   prev_logprobs = torch.as_tensor(self.prev_logprobs, dtype=torch.float32),
@@ -221,24 +258,77 @@ class TrajectoryBuffer():
 ###################### PPO CLASS ######################
 
 class ActorCritic():
-   def __init__(self, state_dim, action_dim, buffer_size, verbose=False):
+   def __init__(self, state_dim, action_dim, buffer_size, action_range, verbose=False):
       # Networks
-      self.pi = Policy(state_dim, action_dim)
+      self.pi = Policy(state_dim, action_dim, action_range)
       self.v = Critic(state_dim)
       # Buffer
       self.buffer = TrajectoryBuffer(state_dim, action_dim, size=buffer_size)
       self.buffer_size = buffer_size
+      # Tracking
       self.pi_losses = []
       self.v_losses = []
+      self.reward_tracking = []
+      self.kl_divergence = []
       # Hyperparameters
       self.ratio_clip = 0.2
-      self.pi_optim = optim.Adam(self.pi.parameters(), lr=2e-4)
+      self.pi_optim = optim.Adam(self.pi.parameters(), lr=1e-4)
       self.critic_opt = optim.Adam(self.v.parameters(), lr=3e-4)
-      self.pi_gradsteps = 7
-      self.v_gradsteps = 7
+      #self.critic_opt = optim.AdamW(self.v.parameters(), lr=2e-4, weight_decay=0.01)
+      self.critic_scheduler = optim.lr_scheduler.ExponentialLR(self.critic_opt, 0.95)
+      self.pi_gradsteps = 5
+      self.v_gradsteps = 5
       self.minib_size = 64
+      self.reward_scalar = 1
+      self.kl_coeff = 0.1
+      # So we know how to apply the tanh to restrict our actions
+      self.action_range = action_range
       #Other
       self.verbose = verbose
+      # Set up observation tracking to normalize observations
+      self.init_obs_tracking(state_dim)
+   
+   def init_obs_tracking(self, state_dim):
+      """
+      Initialize a dictionary `self.inputs` to keep a running average 
+      of the standard deviation and mean of all the observations we've seen.
+
+         :param state_dim = state dimension, number of means / stds to keep track of
+      """
+      self.inputs = dict(
+         m2=np.zeros(state_dim),
+         means=np.zeros(state_dim),
+         step=0
+      )
+   
+   def normalize_observation(self, state) -> torch.Tensor:
+      """
+      Takes a state, and normalizes it to have a mean of 0 and STD of 1,
+      according to a running average that it also updates.
+      Uses Welford's algorithm to keep track of the running mean / STD.
+
+         :param state = state to be normalized
+      """
+      assert state.shape == self.inputs["means"].shape
+      
+
+      # Calculate Mean
+      self.inputs["step"] += 1
+      delta1 = state - self.inputs["means"]
+      self.inputs["means"] += delta1 / self.inputs["step"]
+
+      # Calcualte STD
+      delta2 = state - self.inputs["means"]
+      self.inputs["m2"] += delta1 * delta2
+      var = self.inputs["m2"] / (self.inputs["step"] - 1) if self.inputs["step"] > 1 else 0.0
+      #std = np.maximum(np.sqrt(var), 1e-6)
+      std = np.sqrt(var)
+
+      # Return the normalized observation
+      #normalized_state = (state - self.inputs["means"]) / std
+      normalized_state = (state - self.inputs["means"]) / (std + 1e-8)
+      return torch.as_tensor(normalized_state, dtype=torch.float32)
+
 
    def step(self, states):
       """
@@ -249,12 +339,15 @@ class ActorCritic():
          # Get pi distribution over state(s)
          distrs = self.pi._get_distribution(states)
          # Sample action(s) from pi
-         actions = distrs.sample()
+         raw_actions = distrs.sample()
+         ##### ADDED, MIGHT NOT WORK #####
+         actions = F.tanh(raw_actions)*self.action_range
+         #################################
          # Record log probs for later (training pi network)
-         log_probs = self.pi._get_log_probs(distrs, actions)
-         # Current estimate of value function in order to train it
+         log_probs = self.pi._get_log_probs(distrs, raw_actions)
+         # Current estimate of value function in order to train policy
          values = self.v(states)
-      return actions.numpy(), log_probs.numpy(), values.numpy()
+      return raw_actions.numpy(), log_probs.numpy(), values.numpy(), actions.numpy()
 
 
    def compute_actor_loss(self, data: dict) -> torch.Tensor:
@@ -274,13 +367,17 @@ class ActorCritic():
       #print(f'OLD LOG PROBS OF GIVEN ACTION (ones) - should be the same under same policy\n{old_probs}\n\n')
       # exp( log(pi'(a|s)) - log(pi(a|s)) )
       ratio = torch.exp(primed_log_probs - old_probs)
+      # H(p) = - log(p(x))
+      approx_kl_divergence = old_probs - primed_log_probs
+      kl_loss = approx_kl_divergence * self.kl_coeff
       #print(f"RATIO: {ratio}")
       # 2. rclip(r) * A
       clipped_ratio = torch.clamp(ratio, 1-self.ratio_clip, 1+self.ratio_clip)
       # 3. If the advantage is negative, we don't clip. 
       # Note that we perform gradient ascent (but actually we just take negative and do gradient descent)
       surrogate_loss = -torch.min(clipped_ratio*advantage, ratio*advantage)
-      return surrogate_loss.mean()
+      #surrogate_loss = -torch.min(clipped_ratio*advantage, ratio*advantage) + kl_loss
+      return surrogate_loss.mean(), approx_kl_divergence.mean().item()
       
 
 
@@ -298,6 +395,7 @@ class ActorCritic():
       Calls ActorCritic.step(), and just throws away the log probs and values.
       Used for inference.
       """
+      state = self.normalize_observation(state)
       return self.step(torch.as_tensor(state, dtype=torch.float32))[0]
 
 
@@ -325,46 +423,90 @@ class ActorCritic():
          self.v_losses.append(np.mean(loss))
 
       #N full passes of buffer on actor
-      for _ in range(self.pi_gradsteps):
-         # Track average loss over buffer and keep for logging purpose
+      for s in range(self.pi_gradsteps):
+         # Track average loss & kl divergence over buffer and keep for logging purpose
          loss = []
+         kl_diverge = []
          #mini batch SGD over entire buffer
          for minib_traj in trajectories:
             self.pi_optim.zero_grad()
-            actor_loss = self.compute_actor_loss(minib_traj)
+            actor_loss, dkl = self.compute_actor_loss(minib_traj)
             actor_loss.backward()
             self.pi_optim.step()
+            # Tracking
             loss.append(actor_loss.item())
+            kl_diverge.append(dkl)
          
+         # Logging
          self.pi_losses.append(np.mean(loss))
+         self.kl_divergence.append(np.mean(kl_diverge))
+         if self.kl_divergence[-1] > 0.015:
+            print(f"HIGH AVERAGE DIVERGENCE ON {s}: {self.kl_divergence[-1]}")
    
    def train(self, env, epochs):
       for i in range(epochs):
          state, _ = env.reset()
-         trajectory_rewards = 0
+         # Track the trajectory rewards over each epoch
+         trajectory_rewards = []
+         trajectory_reward = 0.0
+         #Scheduled learning rate for critic
+         if i > 200:
+            self.critic_scheduler.step()
+
          for _ in range(self.buffer_size):
-            action, log_prob, value = self.step(torch.as_tensor(state, dtype=torch.float32))
-            state_p, reward, done, _,  _ = env.step(action)
-            self.buffer.add_experience(state, action, log_prob, value, reward)
-            trajectory_rewards += reward
+            # Normalize the observation
+            #print(f"BEFORE {state}\n")
+            state = self.normalize_observation(state)
+            #print(f"AFTER {state}\n\n")
+
+            raw_action, log_prob, value, true_action = self.step(torch.as_tensor(state, dtype=torch.float32))
+            # Sample action, value, calculate log prob
+            #raw_action, log_prob, value, true_action = self.step(state)
+            #print("ACTIONS", raw_action, true_action)
+            state_p, reward, done, _,  _ = env.step(raw_action)
+            #print("REWARD", reward)
+
+            scaled_reward = reward * self.reward_scalar
+
+            self.buffer.add_experience(state, raw_action, log_prob, value, scaled_reward)
+
+            trajectory_reward += scaled_reward
 
             if done:
+               # At each trajectory, we look back over the entire trajectory and calculate advantages, returns.
                self.buffer.calculate_advantages(final_V=0)
-               if self.verbose: print(f"trajectory reward: {trajectory_rewards}")
-               trajectory_rewards = 0
+
+               # Store trajectory reward and reset
+               if self.verbose: print(f"trajectory reward: {trajectory_reward}")
+               trajectory_rewards.append(trajectory_reward)
+               trajectory_reward = 0.0
                state, _ = env.reset()
+            else:
+               state = state_p
 
          # When we exit an epoch -- either we perfectly ended a trajectory (unlikely) or
          # we were in the middle. If so, need to calculate the advantages.
          if not done:
-            final_state_v = self.v(torch.as_tensor(state_p, dtype=torch.float32)).detach()
+            state_pnorm = self.normalize_observation(state_p)
+            #final_state_v = self.v(torch.as_tensor(state_p, dtype=torch.float32)).detach()
+            final_state_v = self.v(state_pnorm).detach()
             self.buffer.calculate_advantages(final_state_v)
          self.gradient_step()
+         # Average the trajectory rewards across the epoch, store, reset list
+         self.reward_tracking.append(np.mean(trajectory_rewards))
+         print(f"TRAJECTORY REWARDS FOR EPOCH {i}: {trajectory_rewards}\n")
          print(f"ACTOR LOSSES FOR EPOCH {i}. BEFORE: {self.pi_losses[-5]}\tAFTER: {self.pi_losses[-1]}\n")
          print(f"CRITIC LOSSES FOR EPOCH {i}. BEFORE: {self.v_losses[-5]}\tAFTER: {self.v_losses[-1]}\n\n")
 
 
 
+# ppo = ActorCritic(10, 10, 2048)
+# randoms = np.asarray([5, 5, 5, 5, 5, 5, 5, 5, 5, 5])
+# print(ppo.normalize_observation(randoms))
+# print(f"\nMEANS: {ppo.inputs["means"]}\n\nM2: {ppo.inputs["m2"]}\n\n")
+# randoms2 = np.asarray([1,1,1,1,1,10,10,10,10,10])
+# print(ppo.normalize_observation(randoms2))
+# print(f"\nMEANS: {ppo.inputs["means"]}\n\nM2: {ppo.inputs["m2"]}\n\n")
 ############### TEST DATASET ####################
 # import gymnasium as gym
 # env = gym.make('Ant-v5', terminate_when_unhealthy=True)
@@ -384,6 +526,10 @@ class ActorCritic():
 # print(small_batch["rets"].shape)
 # print(small_batch["prev_logprobs"].shape)
 
+# ppo = ActorCritic(10, 10, buffer_size=2048)
+# print(ppo.pi.layers[0].weight)
+# print(ppo.pi.layers[2].weight)
+# print(ppo.pi.layers[4].weight)
 
 # ppo = ActorCritic(10,10)
 # act, log_prob, val = ppo.step(torch.rand(10,10))
